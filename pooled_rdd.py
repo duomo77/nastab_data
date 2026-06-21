@@ -1,18 +1,141 @@
+import os
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from rdrobust import rdrobust
 
 # ==============================================================================
 # 0. 기본 설정 (상수 정의)
 # ==============================================================================
-WAVES = [1, 2, 3, 4, 5, 6, 7, 8] # 실제 사용하시는 웨이브로 수정
+WAVES = [11, 12, 13, 14, 15, 16, 17]
+WAVE_YEAR = {
+    11: 2018, 12: 2019, 13: 2020, 14: 2021,
+    15: 2022, 16: 2023, 17: 2024
+}
+
 OUTCOMES = [
-    "exp_tot", "exp_con", "exp_ncn", "exp_hou", "exp_fod", 
+    "exp_tot", "exp_con", "exp_ncn", "exp_hou", "exp_fod",
     "exp_cul", "exp_clo", "exp_tou", "exp_edu", "exp_hel", "exp_ins"
 ]
 
+BANDWIDTHS = [4, 5, 6]
+POLY_ORDERS = [1, 2]
+CHILD_IDS = range(1, 10)
+
+DATA_DIR = "./data"
+RESULTS_DIR = "./results"
+
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
 # ==============================================================================
-# 1. pooled 변수 생성 함수 (공변량 생성)
+# 1. 데이터 로드 (웨이브별 .dta)
+# ==============================================================================
+def load_wave_data(data_dir):
+    """Load h{wave}.dta files and concatenate with wave column."""
+    frames = []
+    for wave in WAVES:
+        fpath = os.path.join(data_dir, f"h{wave}.dta")
+        if not os.path.exists(fpath):
+            print(f"[WARN] File not found, skipping: {fpath}")
+            continue
+        df = pd.read_stata(fpath)
+        df["wave"] = wave
+        frames.append(df)
+        print(f"[INFO] Loaded {fpath} ({len(df)} rows)")
+
+    if not frames:
+        raise FileNotFoundError(f"No .dta files found in {data_dir}")
+
+    pooled = pd.concat(frames, ignore_index=True)
+    print(f"[INFO] Total pooled rows: {len(pooled)}")
+    return pooled
+
+# ==============================================================================
+# 2. 자녀 Pooling (wide → long) + 나이(개월) 계산
+# ==============================================================================
+def pool_children(df):
+    """
+    Reshape each household row into up to 9 child rows.
+    Compute age_month = (survey_year - byr) * 12 - bmn.
+    """
+    all_child_rows = []
+
+    for wave in WAVES:
+        wave_df = df[df["wave"] == wave].copy()
+        if wave_df.empty:
+            continue
+
+        survey_year = WAVE_YEAR[wave]
+
+        for child_id in CHILD_IDS:
+            byr_col = f"h{wave}byr{child_id:02d}"
+            bmn_col = f"h{wave}bmn{child_id:02d}"
+
+            if byr_col not in wave_df.columns or bmn_col not in wave_df.columns:
+                print(f"[WARN] Missing child columns: {byr_col}, {bmn_col} — skipping child {child_id} in wave {wave}")
+                continue
+
+            child_rows = wave_df[["wave"]].copy()
+            child_rows["child_id"] = child_id
+            child_rows["byr"] = wave_df[byr_col]
+            child_rows["bmn"] = wave_df[bmn_col]
+
+            # age_month = (survey_year - byr) * 12 - bmn
+            child_rows["age_month"] = (survey_year - child_rows["byr"]) * 12 - child_rows["bmn"]
+
+            all_child_rows.append(child_rows)
+
+    if not all_child_rows:
+        raise ValueError("No child rows extracted. Check column naming patterns.")
+
+    child_df = pd.concat(all_child_rows, ignore_index=True)
+    print(f"[INFO] Pooled {len(child_df)} child rows from {len(df)} household rows")
+    return child_df
+
+# ==============================================================================
+# 3. Cutoff 할당 + Running Variable
+# ==============================================================================
+def compute_cutoff(df):
+    """
+    Assign survey_year and cutoff based on WAVE_YEAR:
+      survey_year >= 2022 → 96
+      survey_year >= 2019 → 84
+      else                → 72
+    """
+    df = df.copy()
+    df["survey_year"] = df["wave"].map(WAVE_YEAR)
+
+    def _cutoff(year):
+        if year >= 2022:
+            return 96
+        elif year >= 2019:
+            return 84
+        else:
+            return 72
+
+    df["cut_off"] = df["survey_year"].apply(_cutoff)
+    df["running"] = df["age_month"] - df["cut_off"]
+    print(f"[INFO] Cutoff distribution:\n{df['cut_off'].value_counts().sort_index()}")
+    return df
+
+# ==============================================================================
+# 4. 결과변수 표준화 (h{wave}exp_tot → exp_tot)
+# ==============================================================================
+def create_outcomes(df):
+    """Extract wave-specific outcome columns into standardized names."""
+    for outcome in OUTCOMES:
+        df[outcome] = np.nan
+        for wave in WAVES:
+            col = f"h{wave}{outcome}"
+            if col in df.columns:
+                mask = df["wave"] == wave
+                df.loc[mask, outcome] = df.loc[mask, col]
+    return df
+
+# ==============================================================================
+# 5. 공변량 생성 (inc_a, edu01, capital_area)
 # ==============================================================================
 def create_covariates(df):
     # 소득
@@ -46,120 +169,24 @@ def create_covariates(df):
     return df
 
 # ==============================================================================
-# 2. 데이터 Pooling 및 공변량 추가
+# 6. Balance Test
 # ==============================================================================
-# all_dfs는 각 웨이브별 데이터프레임 리스트라고 가정
-# pooled_df = pd.concat(all_dfs, ignore_index=True)
-# pooled_df = create_covariates(pooled_df)
-
-# ==============================================================================
-# 3~9. RDD 실행 함수 (공변량 통제 및 Mass Point Adjustment 적용)
-# ==============================================================================
-def run_pooled_rd_for_group(df, group_col, group_val, outcome_col):
-    # 3. 필요한 변수만 선택 (공변량 추가)
-    temp_df = df[df[group_col] == group_val][
-        [
-            "age_month",
-            "cut_off",
-            "wave",
-            "inc_a",
-            "edu01",
-            "capital_area",
-            outcome_col
-        ]
-    ].copy()
-
-    # 4. y 변수 할당 
-    # (주의: 요청하신 np.nan 유지 시 5번 dropna에서 데이터가 모두 지워지므로 outcome 데이터 할당)
-    temp_df["y_pooled"] = temp_df[outcome_col] 
-
-    # 5. 결측 제거 (공변량 포함)
-    tmp = temp_df.dropna(
-        subset=[
-            "y_pooled",
-            "age_month",
-            "cut_off",
-            "inc_a",
-            "edu01",
-            "capital_area"
-        ]
-    )
-
-    if tmp.empty:
-        return None
-
-    # 6. Running Variable
-    tmp["running"] = tmp["age_month"] - tmp["cut_off"]
-
-    # RDD용 데이터 추출
-    y_vals = tmp["y_pooled"].astype(float).values
-    x_vals_for_rd = tmp["running"].astype(float).values
-    cutoff = 0.0
-
-    # 7. Covariate Matrix 생성
-    covs = tmp[
-        [
-            "inc_a",
-            "edu01",
-            "capital_area"
-        ]
-    ].astype(float).values
-
-    # 8. rdrobust 실행 (공변량 통제, Mass Point Adjustment)
-    rd = rdrobust(
-        y=y_vals,
-        x=x_vals_for_rd,
-        c=cutoff,
-        kernel="triangular",
-        p=1,
-        covs=covs,
-        masspoints="adjust"
-    )
-
-    # 결과 추출
-    coef = float(rd.coef.iloc[0, 0])
-    se = float(rd.se.iloc[0, 0])
-    pvalue = float(rd.pv.iloc[0, 0])
-    ci_left = float(rd.ci.iloc[0, 0])
-    ci_right = float(rd.ci.iloc[0, 1])
-    n_obs = len(tmp)
-
-    # 9. 결과 저장 (기초통계 포함)
-    result = {
-        "group": group_val,
-        "outcome": outcome_col,
-        "coef": coef,
-        "se": se,
-        "pvalue": pvalue,
-        "ci_left": ci_left,
-        "ci_right": ci_right,
-        "n_obs": n_obs,
-        "mean_income": float(tmp["inc_a"].mean()),
-        "mean_edu": float(tmp["edu01"].mean()),
-        "capital_area_pct": float(tmp["capital_area"].mean() * 100),
-    }
-    
-    return result
-
-# ==============================================================================
-# 10. Balance Test (조작 가능성 및 공변량 균형 검증)
-# ==============================================================================
-def run_balance_test(pooled_df):
+def run_balance_test(df):
     balance_vars = ["inc_a", "edu01", "capital_area"]
     balance_results = []
 
-    # Running variable 계산을 위해 필수 변수만 남기고 결측 제거
-    temp = pooled_df.dropna(
-        subset=["age_month", "cut_off"] + balance_vars
-    ).copy()
+    temp = df.dropna(subset=["age_month", "cut_off"] + balance_vars).copy()
+    if temp.empty:
+        print("[WARN] No data for balance test")
+        return pd.DataFrame()
 
     temp["running"] = temp["age_month"] - temp["cut_off"]
 
     for var in balance_vars:
-        # 각 변수별 결측 제거
         temp_var = temp.dropna(subset=[var])
-        
-        # 공변량 없이 단순 RDD 실행 (계수 0 유의미한지 확인)
+        if temp_var.empty:
+            continue
+
         rd = rdrobust(
             y=temp_var[var].astype(float).values,
             x=temp_var["running"].astype(float).values,
@@ -178,25 +205,234 @@ def run_balance_test(pooled_df):
     return pd.DataFrame(balance_results)
 
 # ==============================================================================
-# 실행 예시 (Main)
+# 7. RDD 실행 (covariates + masspoints + bandwidth + polynomial order)
+# ==============================================================================
+def run_pooled_rd(df, outcome, bandwidth, poly_order):
+    tmp = df.dropna(subset=[outcome, "running", "inc_a", "edu01", "capital_area"]).copy()
+    if tmp.empty:
+        return None
+
+    y_vals = tmp[outcome].astype(float).values
+    x_vals = tmp["running"].astype(float).values
+    covs = tmp[["inc_a", "edu01", "capital_area"]].astype(float).values
+
+    rd = rdrobust(
+        y=y_vals,
+        x=x_vals,
+        c=0,
+        h=bandwidth,
+        kernel="triangular",
+        p=poly_order,
+        covs=covs,
+        masspoints="adjust"
+    )
+
+    return {
+        "outcome": outcome,
+        "bandwidth": bandwidth,
+        "polynomial_order": poly_order,
+        "coef": float(rd.coef.iloc[0, 0]),
+        "se": float(rd.se.iloc[0, 0]),
+        "pvalue": float(rd.pv.iloc[0, 0]),
+        "ci_lower": float(rd.ci.iloc[0, 0]),
+        "ci_upper": float(rd.ci.iloc[0, 1]),
+        "n_obs": int(len(tmp)),
+        "mean_income": float(tmp["inc_a"].mean()),
+        "mean_edu": float(tmp["edu01"].mean()),
+        "capital_area_pct": float(tmp["capital_area"].mean() * 100),
+    }
+
+# ==============================================================================
+# 8. RDD 그래프 (matplotlib 커스텀)
+# ==============================================================================
+def plot_rdd(df, outcome, bandwidth, poly_order, rd_result):
+    tmp = df.dropna(subset=[outcome, "running"]).copy()
+    if tmp.empty:
+        return
+
+    y_vals = tmp[outcome].astype(float).values
+    x_vals = tmp["running"].astype(float).values
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    # Binned scatter
+    n_bins = 50
+    bins = np.linspace(x_vals.min(), x_vals.max(), n_bins + 1)
+    bin_centers = (bins[:-1] + bins[1:]) / 2
+    bin_means = []
+    bin_x_centers = []
+    for i in range(len(bins) - 1):
+        mask = (x_vals >= bins[i]) & (x_vals < bins[i + 1])
+        if mask.sum() > 0:
+            bin_means.append(y_vals[mask].mean())
+            bin_x_centers.append(bin_centers[i])
+
+    ax.scatter(bin_x_centers, bin_means, alpha=0.4, s=20, color="gray", label="Binned means")
+
+    # Fitted polynomial lines (left and right of cutoff)
+    x_left = x_vals[x_vals < 0]
+    x_right = x_vals[x_vals >= 0]
+    y_left = y_vals[x_vals < 0]
+    y_right = y_vals[x_vals >= 0]
+
+    x_fit_left = np.linspace(x_left.min(), 0, 100)
+    x_fit_right = np.linspace(0, x_right.max(), 100)
+
+    if len(x_left) > poly_order and len(y_left) > poly_order:
+        coeffs_left = np.polyfit(x_left, y_left, poly_order)
+        ax.plot(x_fit_left, np.polyval(coeffs_left, x_fit_left),
+                color="blue", linewidth=2, label=f"Left (p={poly_order})")
+
+    if len(x_right) > poly_order and len(y_right) > poly_order:
+        coeffs_right = np.polyfit(x_right, y_right, poly_order)
+        ax.plot(x_fit_right, np.polyval(coeffs_right, x_fit_right),
+                color="red", linewidth=2, label=f"Right (p={poly_order})")
+
+    # Cutoff line
+    ax.axvline(x=0, color="black", linestyle="--", alpha=0.5, label="Cutoff")
+
+    ax.set_xlabel("Running variable (age_month - cutoff)", fontsize=12)
+    ax.set_ylabel(outcome, fontsize=12)
+    ax.set_title(f"RDD: {outcome}  |  h={bandwidth}, p={poly_order}  |  N={rd_result['n_obs']}", fontsize=13)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+    fpath = os.path.join(RESULTS_DIR, f"{outcome}_bw{bandwidth}_p{poly_order}_plot.png")
+    fig.savefig(fpath, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[INFO] Saved plot: {fpath}")
+
+# ==============================================================================
+# 9. 결과 테이블 이미지 (matplotlib table)
+# ==============================================================================
+def plot_table(rd_result):
+    outcome = rd_result["outcome"]
+    bandwidth = rd_result["bandwidth"]
+    poly_order = rd_result["polynomial_order"]
+
+    rows = [
+        ["Coefficient", f"{rd_result['coef']:.4f}"],
+        ["Std. Error", f"{rd_result['se']:.4f}"],
+        ["p-value", f"{rd_result['pvalue']:.4f}"],
+        ["95% CI Lower", f"{rd_result['ci_lower']:.4f}"],
+        ["95% CI Upper", f"{rd_result['ci_upper']:.4f}"],
+        ["N", f"{rd_result['n_obs']}"],
+        ["Mean Income", f"{rd_result['mean_income']:.2f}"],
+        ["Mean Edu", f"{rd_result['mean_edu']:.2f}"],
+        ["Capital Area %", f"{rd_result['capital_area_pct']:.1f}"],
+    ]
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.axis("off")
+    ax.set_title(f"RDD Results: {outcome}  |  h={bandwidth}, p={poly_order}", fontsize=13, pad=20)
+
+    table = ax.table(
+        cellText=[[v] for _, v in rows],
+        rowLabels=[k for k, _ in rows],
+        loc="center",
+        cellLoc="center"
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(11)
+    table.scale(1.2, 1.5)
+
+    # Color header row differently
+    for (row, col), cell in table.get_celld().items():
+        if col == -1:
+            cell.set_facecolor("#f0f0f0")
+            cell.set_text_props(fontweight="bold")
+
+    fpath = os.path.join(RESULTS_DIR, f"{outcome}_bw{bandwidth}_p{poly_order}_table.png")
+    fig.savefig(fpath, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[INFO] Saved table: {fpath}")
+
+# ==============================================================================
+# 실행 (Main)
 # ==============================================================================
 if __name__ == "__main__":
-    # 1. 데이터 합치기 및 공변량 생성 (2번 단계)
-    # pooled_df = pd.concat(all_dfs, ignore_index=True)
-    # pooled_df = create_covariates(pooled_df)
-    
-    # 2. Balance Test 실행 (10번 단계)
-    # balance_df = run_balance_test(pooled_df)
-    # print("=== Balance Test Results ===")
-    # print(balance_df)
-    
-    # 3. 그룹별/결과변수별 RDD 실행 (3~9번 단계)
-    # rd_results = []
-    # for outcome in OUTCOMES:
-    #     res = run_pooled_rd_for_group(pooled_df, "group_col", "target_group", outcome)
-    #     if res:
-    #         rd_results.append(res)
-    #         
-    # rd_results_df = pd.DataFrame(rd_results)
-    # print("=== RDD Results ===")
-    # print(rd_results_df)
+    print("=" * 60)
+    print("Pooled RDD Analysis — Child-level, bandwidths [4,5,6], p=[1,2]")
+    print("=" * 60)
+
+    # 1. 데이터 로드
+    print("\n[Step 1] Loading wave data...")
+    pooled_df = load_wave_data(DATA_DIR)
+
+    # 2. 자녀 풀링 + 나이 계산
+    print("\n[Step 2] Pooling children...")
+    child_df = pool_children(pooled_df)
+    del pooled_df  # free memory
+
+    # 3. Cutoff + Running Variable
+    print("\n[Step 3] Computing cutoff...")
+    child_df = compute_cutoff(child_df)
+
+    # 4. 결과변수 표준화
+    print("\n[Step 4] Extracting outcomes...")
+    child_df = create_outcomes(child_df)
+
+    # 5. 공변량 생성
+    print("\n[Step 5] Creating covariates...")
+    child_df = create_covariates(child_df)
+
+    # 6. Balance Test
+    print("\n[Step 6] Running balance test...")
+    balance_df = run_balance_test(child_df)
+    if not balance_df.empty:
+        print(balance_df.to_string(index=False))
+        fig, ax = plt.subplots(figsize=(6, 3))
+        ax.axis("off")
+        ax.set_title("Balance Test Results", fontsize=13, pad=15)
+        table = ax.table(
+            cellText=[
+                [f"{row['coef']:.4f}", f"{row['se']:.4f}", f"{row['pvalue']:.4f}"]
+                for _, row in balance_df.iterrows()
+            ],
+            colLabels=["Coefficient", "Std. Error", "p-value"],
+            rowLabels=balance_df["variable"].tolist(),
+            loc="center",
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(11)
+        table.scale(1.2, 1.5)
+        balance_path = os.path.join(RESULTS_DIR, "balance_table.png")
+        fig.savefig(balance_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[INFO] Saved balance table: {balance_path}")
+
+    # 7. RDD 실행 (outcome × bandwidth × polynomial)
+    print("\n[Step 7] Running RDD...")
+    all_results = []
+    total = len(OUTCOMES) * len(BANDWIDTHS) * len(POLY_ORDERS)
+    count = 0
+
+    for outcome in OUTCOMES:
+        for bw in BANDWIDTHS:
+            for p in POLY_ORDERS:
+                count += 1
+                print(f"  [{count}/{total}] {outcome} | bw={bw} | p={p}")
+
+                result = run_pooled_rd(child_df, outcome, bw, p)
+                if result is None:
+                    print(f"    [WARN] No data — skipped")
+                    continue
+
+                all_results.append(result)
+
+                # Plot & table
+                plot_rdd(child_df, outcome, bw, p, result)
+                plot_table(result)
+
+    # 8. 결과 저장
+    if all_results:
+        results_df = pd.DataFrame(all_results)
+        summary_path = os.path.join(RESULTS_DIR, "summary.csv")
+        results_df.to_csv(summary_path, index=False)
+        print(f"\n[INFO] Saved summary: {summary_path}")
+        print("\n=== Summary ===")
+        print(results_df[["outcome", "bandwidth", "polynomial_order", "coef", "se", "pvalue", "n_obs"]].to_string(index=False))
+    else:
+        print("\n[WARN] No RDD results generated.")
+
+    print("\nDone.")
